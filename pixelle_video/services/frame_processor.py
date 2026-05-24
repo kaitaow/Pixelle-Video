@@ -20,6 +20,7 @@ Key Feature:
   to ensure perfect sync between audio and video (no padding, no trimming needed)
 """
 
+import os
 from typing import Callable, Optional
 
 import httpx
@@ -420,18 +421,63 @@ class FrameProcessor:
         media_type: str
     ) -> str:
         """Download media (image or video) from URL to local file"""
+        import asyncio
+        import urllib.parse
         from pixelle_video.utils.os_util import get_task_frame_path
         output_path = get_task_frame_path(task_id, frame_index, media_type)
-        
+
         timeout = httpx.Timeout(connect=10.0, read=60, write=60, pool=60)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            
-            with open(output_path, 'wb') as f:
-                f.write(response.content)
-        
-        return output_path
+        max_retries = 5
+        last_exception = None
+
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.get(url)
+                    response.raise_for_status()
+
+                    with open(output_path, 'wb') as f:
+                        f.write(response.content)
+
+                return output_path
+            except (httpx.HTTPStatusError, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    wait = 1.5 ** attempt
+                    logger.warning(f"  ⚠️ Download failed (attempt {attempt + 1}/{max_retries}): {e}, retrying in {wait:.1f}s...")
+                    await asyncio.sleep(wait)
+                else:
+                    logger.warning(f"  ⚠️ HTTP download failed, trying local file fallback...")
+                    break
+
+        local_path = self._try_local_fallback(url)
+        if local_path and os.path.exists(local_path):
+            import shutil
+            shutil.copy2(local_path, output_path)
+            logger.info(f"  ✅ Retrieved from local: {local_path}")
+            return output_path
+
+        raise last_exception
+
+    def _try_local_fallback(self, url: str) -> str | None:
+        """Try to read file from local ComfyUI output directory"""
+        import urllib.parse
+        if not url or "/view?" not in url:
+            return None
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query)
+        filename = params.get("filename", [None])[0]
+        media_type_param = params.get("type", ["output"])[0]
+        if not filename:
+            return None
+        possible_dirs = []
+        for base in [r"D:\dev\works\ComfyUI"]:
+            possible_dirs.append(os.path.join(base, media_type_param, filename))
+            possible_dirs.append(os.path.join(base, "output", filename))
+        for p in possible_dirs:
+            if os.path.exists(p):
+                return p
+        return None
     
     async def _get_video_duration(self, video_path: str) -> float:
         """Get video duration in seconds"""
